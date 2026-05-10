@@ -46,6 +46,7 @@
 #include <memory>
 #include <initializer_list>
 #include <new>
+#include <climits>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -119,6 +120,61 @@ struct ParsedUrl
     std::wstring pathAndQuery;
     bool https = false;
 };
+
+
+enum class DownloadError
+{
+    None,
+    Cancelled,
+    InvalidUrl,
+    OpenSessionFailed,
+    ConnectFailed,
+    OpenRequestFailed,
+    SendFailed,
+    ReceiveFailed,
+    HttpStatus,
+    HtmlInsteadOfFile,
+    HtmlLinkNotFound,
+    ReadFailed,
+    FileOpenFailed,
+    FileWriteFailed,
+    MoveFailed,
+    SizeMismatch,
+    TooManyRedirects
+};
+
+struct DownloadResult
+{
+    bool ok = false;
+    DownloadError error = DownloadError::None;
+    DWORD httpStatus = 0;
+    DWORD win32Error = 0;
+    unsigned long long contentLength = 0;
+    unsigned long long bytesWritten = 0;
+    unsigned long long resumeFrom = 0;
+    bool resumed = false;
+    bool retryable = false;
+    std::wstring finalUrl;
+    std::wstring message;
+};
+
+static DownloadResult MakeDownloadError(DownloadError error, DWORD win32Error = 0, bool retryable = true)
+{
+    DownloadResult result;
+    result.ok = false;
+    result.error = error;
+    result.win32Error = win32Error;
+    result.retryable = retryable;
+    return result;
+}
+
+static DownloadResult MakeDownloadOk()
+{
+    DownloadResult result;
+    result.ok = true;
+    result.error = DownloadError::None;
+    return result;
+}
 
 struct Particle
 {
@@ -746,6 +802,113 @@ static bool FileExists(const std::wstring& path)
     return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+
+static bool GetFileSizeBytes(const std::wstring& path, unsigned long long& outSize)
+{
+    outSize = 0;
+
+    HANDLE file = CreateFileW(
+        path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+
+    if (file == INVALID_HANDLE_VALUE)
+        return false;
+
+    LARGE_INTEGER size{};
+    bool ok = GetFileSizeEx(file, &size) != FALSE && size.QuadPart >= 0;
+    CloseHandle(file);
+
+    if (!ok)
+        return false;
+
+    outSize = static_cast<unsigned long long>(size.QuadPart);
+    return true;
+}
+
+static unsigned long long GetFileSizeBytesOrZero(const std::wstring& path)
+{
+    unsigned long long size = 0;
+    GetFileSizeBytes(path, size);
+    return size;
+}
+
+static bool ParseUnsignedLongLong(const std::wstring& value, unsigned long long& out)
+{
+    out = 0;
+    if (value.empty())
+        return false;
+
+    size_t i = 0;
+    while (i < value.size() && iswspace(value[i]))
+        ++i;
+
+    bool hasDigit = false;
+    for (; i < value.size(); ++i)
+    {
+        wchar_t ch = value[i];
+        if (iswspace(ch))
+            break;
+
+        if (ch < L'0' || ch > L'9')
+            return false;
+
+        hasDigit = true;
+        unsigned long long digit = static_cast<unsigned long long>(ch - L'0');
+        if (out > (ULLONG_MAX - digit) / 10)
+            return false;
+
+        out = out * 10 + digit;
+    }
+
+    return hasDigit;
+}
+
+static void LogDownloadAttemptFailure(const std::wstring& displayName, int attempt, int totalAttempts, const DownloadResult& result)
+{
+    (void)displayName;
+    (void)attempt;
+    (void)totalAttempts;
+    (void)result;
+
+    // Подробные причины ошибок намеренно не выводятся в UI.
+    // Итоговый короткий статус уже пишет ProcessItem(): "Не скачалось" / "Отменено".
+}
+
+static DWORD GetRetryDelayMs(int attempt)
+{
+    static const DWORD delays[] = { 0, 1000, 3000, 7000 };
+    if (attempt <= 0)
+        return 0;
+
+    size_t index = static_cast<size_t>(attempt);
+    if (index >= ARRAYSIZE(delays))
+        index = ARRAYSIZE(delays) - 1;
+
+    return delays[index];
+}
+
+static bool SleepRetryDelay(DWORD delayMs)
+{
+    DWORD slept = 0;
+    while (slept < delayMs)
+    {
+        if (IsCancelRequested())
+            return false;
+
+        DWORD chunk = std::min<DWORD>(150, delayMs - slept);
+        Sleep(chunk);
+        slept += chunk;
+    }
+
+    return true;
+}
+
 static bool DirectoryExists(const std::wstring& path)
 {
     DWORD attr = GetFileAttributesW(path.c_str());
@@ -1164,6 +1327,13 @@ static std::wstring QueryHeader(HINTERNET request, DWORD query)
     return value;
 }
 
+static unsigned long long QueryContentLength(HINTERNET request)
+{
+    std::wstring header = QueryHeader(request, WINHTTP_QUERY_CONTENT_LENGTH);
+    unsigned long long value = 0;
+    return ParseUnsignedLongLong(header, value) ? value : 0;
+}
+
 static bool ReadAll(HINTERNET request, std::vector<unsigned char>& out, size_t maxBytes = HTML_READ_LIMIT)
 {
     out.clear();
@@ -1211,22 +1381,27 @@ static bool LooksLikeHtml(const std::wstring& contentType)
         ct.find(L"application/xhtml") != std::wstring::npos;
 }
 
-static bool DownloadRecursive(
+static bool IsRetryableHttpStatus(DWORD status)
+{
+    return status == 408 || status == 416 || status == 429 || status >= 500;
+}
+
+static DownloadResult DownloadRecursiveOnce(
     const std::wstring& url,
     const std::wstring& targetPath,
     const std::wstring& displayName,
     int depth)
 {
     if (IsCancelRequested())
-        return false;
+        return MakeDownloadError(DownloadError::Cancelled, 0, false);
 
     if (depth > 4)
-        return false;
+        return MakeDownloadError(DownloadError::TooManyRedirects, 0, false);
 
     ParsedUrl p;
 
     if (!ParseUrl(url, p))
-        return false;
+        return MakeDownloadError(DownloadError::InvalidUrl, GetLastError(), false);
 
     HINTERNET session = nullptr;
     HINTERNET connect = nullptr;
@@ -1234,11 +1409,17 @@ static bool DownloadRecursive(
     std::shared_ptr<HttpHandleSlot> sessionSlot;
     std::shared_ptr<HttpHandleSlot> connectSlot;
     std::shared_ptr<HttpHandleSlot> requestSlot;
-    std::wstring requestHeaders;
-    bool ok = false;
+
+    auto finish = [&](DownloadResult result) -> DownloadResult
+    {
+        CloseTrackedHttpHandle(requestSlot);
+        CloseTrackedHttpHandle(connectSlot);
+        CloseTrackedHttpHandle(sessionSlot);
+        return result;
+    };
 
     session = WinHttpOpen(
-        L"Mozilla/5.0 HolyCheckDownloader/9.0",
+        L"Mozilla/5.0 HolyCheckDownloader/9.3",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -1246,7 +1427,7 @@ static bool DownloadRecursive(
     );
 
     if (!session)
-        return false;
+        return MakeDownloadError(DownloadError::OpenSessionFailed, GetLastError(), true);
 
     sessionSlot = TrackHttpHandle(session);
 
@@ -1268,7 +1449,7 @@ static bool DownloadRecursive(
     connect = WinHttpConnect(session, p.host.c_str(), p.port, 0);
 
     if (!connect)
-        goto cleanup;
+        return finish(MakeDownloadError(DownloadError::ConnectFailed, GetLastError(), true));
 
     connectSlot = TrackHttpHandle(connect);
 
@@ -1283,11 +1464,11 @@ static bool DownloadRecursive(
     );
 
     if (!request)
-        goto cleanup;
+        return finish(MakeDownloadError(DownloadError::OpenRequestFailed, GetLastError(), true));
 
     requestSlot = TrackHttpHandle(request);
 
-    requestHeaders =
+    std::wstring requestHeaders =
         L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36\r\n"
         L"Accept: application/octet-stream,application/zip,application/x-zip-compressed,application/x-msdownload,application/java-archive,*/*;q=0.8\r\n"
         L"Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.7,en;q=0.6\r\n"
@@ -1298,6 +1479,13 @@ static bool DownloadRecursive(
     if (ToLower(url).find(L"mods.holyworld.me") != std::wstring::npos)
         requestHeaders += L"Referer: https://mods.holyworld.me/applications\r\n";
 
+    std::wstring partPath = targetPath + L".part";
+    unsigned long long resumeFrom = GetFileSizeBytesOrZero(partPath);
+
+    // Resume an interrupted .part file instead of starting from zero.
+    if (resumeFrom > 0)
+        requestHeaders += L"Range: bytes=" + std::to_wstring(resumeFrom) + L"-\r\n";
+
     WinHttpAddRequestHeaders(
         request,
         requestHeaders.c_str(),
@@ -1306,134 +1494,257 @@ static bool DownloadRecursive(
     );
 
     if (IsCancelRequested())
-        goto cleanup;
+        return finish(MakeDownloadError(DownloadError::Cancelled, 0, false));
 
     if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0))
-        goto cleanup;
+        return finish(MakeDownloadError(DownloadError::SendFailed, GetLastError(), true));
 
     if (IsCancelRequested())
-        goto cleanup;
+        return finish(MakeDownloadError(DownloadError::Cancelled, 0, false));
 
     if (!WinHttpReceiveResponse(request, nullptr))
-        goto cleanup;
+        return finish(MakeDownloadError(DownloadError::ReceiveFailed, GetLastError(), true));
 
     if (IsCancelRequested())
-        goto cleanup;
+        return finish(MakeDownloadError(DownloadError::Cancelled, 0, false));
 
+    DWORD status = QueryStatus(request);
+
+    if (resumeFrom > 0 && status == 416)
     {
-        DWORD status = QueryStatus(request);
-
-        if (status < 200 || status >= 300)
-            goto cleanup;
-
-        std::wstring contentType = QueryHeader(request, WINHTTP_QUERY_CONTENT_TYPE);
-
-        if (LooksLikeHtml(contentType))
-        {
-            std::vector<unsigned char> html;
-
-            if (!ReadAll(request, html, HTML_READ_LIMIT))
-                goto cleanup;
-
-            std::wstring direct = FindBinaryLink(url, html);
-
-            if (direct.empty())
-                goto cleanup;
-
-            CloseTrackedHttpHandle(requestSlot);
-            CloseTrackedHttpHandle(connectSlot);
-            CloseTrackedHttpHandle(sessionSlot);
-
-            return DownloadRecursive(direct, targetPath, displayName, depth + 1);
-        }
-
-        std::wstring partPath = targetPath + L".part";
-
-        HANDLE file = CreateFileW(
-            partPath.c_str(),
-            GENERIC_WRITE,
-            0,
-            nullptr,
-            CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            nullptr
-        );
-
-        if (file == INVALID_HANDLE_VALUE)
-            goto cleanup;
-
-        const DWORD BUFFER_SIZE = 1024 * 1024;
-        std::vector<unsigned char> buffer(BUFFER_SIZE);
-
-        for (;;)
-        {
-            if (IsCancelRequested())
-            {
-                CloseHandle(file);
-                DeleteFileW(partPath.c_str());
-                goto cleanup;
-            }
-
-            DWORD available = 0;
-
-            if (!WinHttpQueryDataAvailable(request, &available))
-            {
-                CloseHandle(file);
-                DeleteFileW(partPath.c_str());
-                goto cleanup;
-            }
-
-            if (available == 0)
-                break;
-
-            DWORD toRead = std::min<DWORD>(available, BUFFER_SIZE);
-            DWORD read = 0;
-
-            if (!WinHttpReadData(request, buffer.data(), toRead, &read))
-            {
-                CloseHandle(file);
-                DeleteFileW(partPath.c_str());
-                goto cleanup;
-            }
-
-            if (read == 0)
-                break;
-
-            DWORD written = 0;
-
-            if (!WriteFile(file, buffer.data(), read, &written, nullptr) || written != read)
-            {
-                CloseHandle(file);
-                DeleteFileW(partPath.c_str());
-                goto cleanup;
-            }
-        }
-
-        CloseHandle(file);
-
-        if (IsCancelRequested())
-        {
-            DeleteFileW(partPath.c_str());
-            goto cleanup;
-        }
-
-        DeleteFileW(targetPath.c_str());
-
-        if (!MoveFileW(partPath.c_str(), targetPath.c_str()))
-        {
-            DeleteFileW(partPath.c_str());
-            goto cleanup;
-        }
-
-        ok = true;
+        // Local .part is probably larger/equal to the remote object or the server
+        // rejected the range. Reset it and let the retry start cleanly.
+        DeleteFileW(partPath.c_str());
+        DownloadResult result = MakeDownloadError(DownloadError::HttpStatus, 0, true);
+        result.httpStatus = status;
+        result.resumeFrom = resumeFrom;
+        return finish(result);
     }
 
-cleanup:
-    CloseTrackedHttpHandle(requestSlot);
-    CloseTrackedHttpHandle(connectSlot);
-    CloseTrackedHttpHandle(sessionSlot);
+    if (status < 200 || status >= 300)
+    {
+        DownloadResult result = MakeDownloadError(DownloadError::HttpStatus, 0, IsRetryableHttpStatus(status));
+        result.httpStatus = status;
+        result.resumeFrom = resumeFrom;
+        return finish(result);
+    }
 
-    return ok;
+    bool appendToPart = resumeFrom > 0 && status == 206;
+
+    // Some servers ignore Range and return 200. In that case restart safely.
+    if (resumeFrom > 0 && status == 200)
+    {
+        DeleteFileW(partPath.c_str());
+        resumeFrom = 0;
+        appendToPart = false;
+    }
+
+    std::wstring contentType = QueryHeader(request, WINHTTP_QUERY_CONTENT_TYPE);
+
+    if (LooksLikeHtml(contentType))
+    {
+        std::vector<unsigned char> html;
+
+        if (!ReadAll(request, html, HTML_READ_LIMIT))
+        {
+            DownloadResult result = MakeDownloadError(DownloadError::ReadFailed, GetLastError(), true);
+            result.httpStatus = status;
+            result.resumeFrom = resumeFrom;
+            return finish(result);
+        }
+
+        std::wstring direct = FindBinaryLink(url, html);
+
+        if (direct.empty())
+        {
+            DownloadResult result = MakeDownloadError(DownloadError::HtmlLinkNotFound, 0, false);
+            result.httpStatus = status;
+            result.resumeFrom = resumeFrom;
+            return finish(result);
+        }
+
+        CloseTrackedHttpHandle(requestSlot);
+        CloseTrackedHttpHandle(connectSlot);
+        CloseTrackedHttpHandle(sessionSlot);
+
+        DownloadResult redirected = DownloadRecursiveOnce(direct, targetPath, displayName, depth + 1);
+        if (redirected.finalUrl.empty())
+            redirected.finalUrl = direct;
+        return redirected;
+    }
+
+    unsigned long long expectedBytesThisResponse = QueryContentLength(request);
+
+    HANDLE file = CreateFileW(
+        partPath.c_str(),
+        GENERIC_WRITE,
+        0,
+        nullptr,
+        appendToPart ? OPEN_ALWAYS : CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        DownloadResult result = MakeDownloadError(DownloadError::FileOpenFailed, GetLastError(), true);
+        result.httpStatus = status;
+        result.resumeFrom = resumeFrom;
+        return finish(result);
+    }
+
+    if (appendToPart)
+    {
+        LARGE_INTEGER pos{};
+        pos.QuadPart = static_cast<LONGLONG>(resumeFrom);
+        if (!SetFilePointerEx(file, pos, nullptr, FILE_BEGIN))
+        {
+            DWORD err = GetLastError();
+            CloseHandle(file);
+            DownloadResult result = MakeDownloadError(DownloadError::FileOpenFailed, err, true);
+            result.httpStatus = status;
+            result.resumeFrom = resumeFrom;
+            return finish(result);
+        }
+    }
+
+    const DWORD BUFFER_SIZE = 1024 * 1024;
+    std::vector<unsigned char> buffer(BUFFER_SIZE);
+    unsigned long long bytesWrittenThisResponse = 0;
+
+    for (;;)
+    {
+        if (IsCancelRequested())
+        {
+            CloseHandle(file);
+            DownloadResult result = MakeDownloadError(DownloadError::Cancelled, 0, false);
+            result.httpStatus = status;
+            result.resumeFrom = resumeFrom;
+            result.bytesWritten = bytesWrittenThisResponse;
+            return finish(result);
+        }
+
+        DWORD available = 0;
+
+        if (!WinHttpQueryDataAvailable(request, &available))
+        {
+            DWORD err = GetLastError();
+            CloseHandle(file);
+            DownloadResult result = MakeDownloadError(DownloadError::ReadFailed, err, true);
+            result.httpStatus = status;
+            result.resumeFrom = resumeFrom;
+            result.bytesWritten = bytesWrittenThisResponse;
+            return finish(result);
+        }
+
+        if (available == 0)
+            break;
+
+        DWORD toRead = std::min<DWORD>(available, BUFFER_SIZE);
+        DWORD read = 0;
+
+        if (!WinHttpReadData(request, buffer.data(), toRead, &read))
+        {
+            DWORD err = GetLastError();
+            CloseHandle(file);
+            DownloadResult result = MakeDownloadError(DownloadError::ReadFailed, err, true);
+            result.httpStatus = status;
+            result.resumeFrom = resumeFrom;
+            result.bytesWritten = bytesWrittenThisResponse;
+            return finish(result);
+        }
+
+        if (read == 0)
+            break;
+
+        DWORD written = 0;
+
+        if (!WriteFile(file, buffer.data(), read, &written, nullptr) || written != read)
+        {
+            DWORD err = GetLastError();
+            CloseHandle(file);
+            DownloadResult result = MakeDownloadError(DownloadError::FileWriteFailed, err, true);
+            result.httpStatus = status;
+            result.resumeFrom = resumeFrom;
+            result.bytesWritten = bytesWrittenThisResponse;
+            return finish(result);
+        }
+
+        bytesWrittenThisResponse += written;
+    }
+
+    CloseHandle(file);
+
+    if (expectedBytesThisResponse > 0 && bytesWrittenThisResponse < expectedBytesThisResponse)
+    {
+        DownloadResult result = MakeDownloadError(DownloadError::SizeMismatch, 0, true);
+        result.httpStatus = status;
+        result.contentLength = expectedBytesThisResponse;
+        result.bytesWritten = bytesWrittenThisResponse;
+        result.resumeFrom = resumeFrom;
+        return finish(result);
+    }
+
+    if (IsCancelRequested())
+    {
+        DownloadResult result = MakeDownloadError(DownloadError::Cancelled, 0, false);
+        result.httpStatus = status;
+        result.resumeFrom = resumeFrom;
+        result.bytesWritten = bytesWrittenThisResponse;
+        return finish(result);
+    }
+
+    DeleteFileW(targetPath.c_str());
+
+    if (!MoveFileW(partPath.c_str(), targetPath.c_str()))
+    {
+        DownloadResult result = MakeDownloadError(DownloadError::MoveFailed, GetLastError(), true);
+        result.httpStatus = status;
+        result.resumeFrom = resumeFrom;
+        result.bytesWritten = bytesWrittenThisResponse;
+        return finish(result);
+    }
+
+    DownloadResult ok = MakeDownloadOk();
+    ok.httpStatus = status;
+    ok.contentLength = expectedBytesThisResponse;
+    ok.bytesWritten = bytesWrittenThisResponse;
+    ok.resumeFrom = resumeFrom;
+    ok.resumed = appendToPart;
+    ok.finalUrl = url;
+    return finish(ok);
+}
+
+static bool DownloadRecursive(
+    const std::wstring& url,
+    const std::wstring& targetPath,
+    const std::wstring& displayName,
+    int depth)
+{
+    const int maxAttempts = depth == 0 ? 4 : 3;
+    DownloadResult lastResult;
+
+    for (int attempt = 1; attempt <= maxAttempts; ++attempt)
+    {
+        if (attempt > 1 && !SleepRetryDelay(GetRetryDelayMs(attempt - 1)))
+            return false;
+
+        lastResult = DownloadRecursiveOnce(url, targetPath, displayName, depth);
+
+        if (lastResult.ok)
+        {
+            if (lastResult.resumed)
+                PostLog(L"Докачано: " + displayName);
+            return true;
+        }
+
+        LogDownloadAttemptFailure(displayName, attempt, maxAttempts, lastResult);
+
+        if (!lastResult.retryable || IsCancelRequested())
+            break;
+    }
+
+    return false;
 }
 
 static bool FindFirstExeRecursive(const std::wstring& folder, std::wstring& outPath);
@@ -2549,7 +2860,6 @@ static bool DownloadWithCurlFallback(const std::wstring& url, const std::wstring
         return false;
 
     std::wstring partPath = targetPath + L".part";
-    DeleteFileW(partPath.c_str());
 
     std::wstring curlExe = GetSystemToolPath(L"curl.exe");
     DWORD maxTimeSeconds = std::max<DWORD>(8, timeoutMs / 1000);
@@ -2558,6 +2868,7 @@ static bool DownloadWithCurlFallback(const std::wstring& url, const std::wstring
     std::wstring command =
         QuoteProcessArgument(curlExe) +
         L" -L --fail --silent --show-error --http1.1 --ipv4 --ssl-no-revoke --tcp-nodelay"
+        L" -C -"
         L" --retry 1 --retry-delay 1 --retry-connrefused"
         L" --speed-limit 2048 --speed-time 30"
         L" --connect-timeout " + std::to_wstring(connectTimeoutSeconds) +
@@ -2598,7 +2909,6 @@ static bool DownloadWithCurlFallback(const std::wstring& url, const std::wstring
             WaitForSingleObject(pi.hProcess, 1000);
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
-            DeleteFileW(partPath.c_str());
             return false;
         }
     }
@@ -2610,18 +2920,12 @@ static bool DownloadWithCurlFallback(const std::wstring& url, const std::wstring
     CloseHandle(pi.hProcess);
 
     if (exitCode != 0 || !FileExists(partPath) || IsCancelRequested())
-    {
-        DeleteFileW(partPath.c_str());
         return false;
-    }
 
     DeleteFileW(targetPath.c_str());
 
     if (!MoveFileW(partPath.c_str(), targetPath.c_str()))
-    {
-        DeleteFileW(partPath.c_str());
         return false;
-    }
 
     return true;
 }
@@ -2633,7 +2937,6 @@ static bool DownloadWithCurlBrowserLike(const std::wstring& url, const std::wstr
         return false;
 
     std::wstring partPath = targetPath + L".part";
-    DeleteFileW(partPath.c_str());
 
     std::wstring curlExe = GetSystemToolPath(L"curl.exe");
     DWORD maxTimeSeconds = std::max<DWORD>(300, timeoutMs / 1000);
@@ -2645,6 +2948,7 @@ static bool DownloadWithCurlBrowserLike(const std::wstring& url, const std::wstr
     std::wstring command =
         QuoteProcessArgument(curlExe) +
         L" -L --fail --silent --show-error --http1.1 --ipv4 --ssl-no-revoke --tcp-nodelay"
+        L" -C -"
         L" --retry 3 --retry-delay 2 --retry-connrefused"
         L" --connect-timeout 15"
         L" --max-time " + std::to_wstring(maxTimeSeconds) +
@@ -2685,7 +2989,6 @@ static bool DownloadWithCurlBrowserLike(const std::wstring& url, const std::wstr
             WaitForSingleObject(pi.hProcess, 1000);
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
-            DeleteFileW(partPath.c_str());
             return false;
         }
     }
@@ -2697,18 +3000,12 @@ static bool DownloadWithCurlBrowserLike(const std::wstring& url, const std::wstr
     CloseHandle(pi.hProcess);
 
     if (exitCode != 0 || !FileExists(partPath) || IsCancelRequested())
-    {
-        DeleteFileW(partPath.c_str());
         return false;
-    }
 
     DeleteFileW(targetPath.c_str());
 
     if (!MoveFileW(partPath.c_str(), targetPath.c_str()))
-    {
-        DeleteFileW(partPath.c_str());
         return false;
-    }
 
     return true;
 }
@@ -2776,7 +3073,6 @@ static bool DownloadWithPowerShellFallback(const std::wstring& url, const std::w
             WaitForSingleObject(pi.hProcess, 1000);
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
-            DeleteFileW(partPath.c_str());
             return false;
         }
     }
@@ -2788,18 +3084,12 @@ static bool DownloadWithPowerShellFallback(const std::wstring& url, const std::w
     CloseHandle(pi.hProcess);
 
     if (exitCode != 0 || !FileExists(partPath) || IsCancelRequested())
-    {
-        DeleteFileW(partPath.c_str());
         return false;
-    }
 
     DeleteFileW(targetPath.c_str());
 
     if (!MoveFileW(partPath.c_str(), targetPath.c_str()))
-    {
-        DeleteFileW(partPath.c_str());
         return false;
-    }
 
     return true;
 }
@@ -3137,6 +3427,74 @@ static bool LooksLikeDownloadedHtml(const std::vector<unsigned char>& data)
         head.find("<body") != std::string::npos;
 }
 
+
+static bool IsZipArchiveStructurallyValid(const std::wstring& path)
+{
+    unsigned long long totalSize = 0;
+    if (!GetFileSizeBytes(path, totalSize) || totalSize < 22)
+        return false;
+
+    HANDLE file = CreateFileW(
+        path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+
+    if (file == INVALID_HANDLE_VALUE)
+        return false;
+
+    DWORD tailSize = static_cast<DWORD>(std::min<unsigned long long>(totalSize, 65557));
+    LARGE_INTEGER offset{};
+    offset.QuadPart = static_cast<LONGLONG>(totalSize - tailSize);
+
+    if (!SetFilePointerEx(file, offset, nullptr, FILE_BEGIN))
+    {
+        CloseHandle(file);
+        return false;
+    }
+
+    std::vector<unsigned char> tail(tailSize);
+    DWORD read = 0;
+    bool ok = ReadFile(file, tail.data(), tailSize, &read, nullptr) != FALSE;
+    CloseHandle(file);
+
+    if (!ok || read < 22)
+        return false;
+
+    tail.resize(read);
+
+    // End of Central Directory signature. This catches most truncated ZIP/JAR files
+    // without extracting the archive.
+    for (size_t i = tail.size() - 22; i != static_cast<size_t>(-1); --i)
+    {
+        if (i + 4 <= tail.size() &&
+            tail[i] == 0x50 && tail[i + 1] == 0x4B && tail[i + 2] == 0x05 && tail[i + 3] == 0x06)
+        {
+            return true;
+        }
+
+        if (i == 0)
+            break;
+    }
+
+    // Some ZIP64 archives can be unusual; still require a central-directory marker.
+    for (size_t i = 0; i + 4 <= tail.size(); ++i)
+    {
+        if (tail[i] == 0x50 && tail[i + 1] == 0x4B &&
+            ((tail[i + 2] == 0x06 && tail[i + 3] == 0x06) ||
+             (tail[i + 2] == 0x06 && tail[i + 3] == 0x07)))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static bool IsValidDownloadedPayload(const DownloadItem& item, const std::wstring& path)
 {
     if (!FileExists(path))
@@ -3197,7 +3555,7 @@ static bool IsValidDownloadedPayload(const DownloadItem& item, const std::wstrin
         return StartsWithBytes(head, { 0x4D, 0x5A });
 
     if (EndsWithI(fileLower, L".zip") || EndsWithI(fileLower, L".jar"))
-        return StartsWithBytes(head, { 0x50, 0x4B });
+        return StartsWithBytes(head, { 0x50, 0x4B }) && IsZipArchiveStructurallyValid(path);
 
     if (EndsWithI(fileLower, L".rar"))
         return StartsWithBytes(head, { 0x52, 0x61, 0x72, 0x21 });
